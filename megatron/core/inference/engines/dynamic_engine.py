@@ -30,11 +30,13 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
 from megatron.core.inference.headers import Headers, UnknownHeaderError
+from megatron.core.inference.communication_utils import is_pipeline_first_stage
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    DynamicVLMInferenceRequest,
     Status,
 )
 from megatron.core.inference.sampling_params import SamplingParams
@@ -789,13 +791,30 @@ class DynamicInferenceEngine(AbstractEngine):
         request_id: int,
         prompt: Union[str, List[int], Tensor],
         sampling_params: Optional[SamplingParams] = None,
+        *,
+        imgs: Optional[Tensor] = None,
+        num_tiles: Optional[Tensor] = None,
+        num_img_embeddings_per_tile: int = 0,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
+
+        Supports both text-only and multimodal requests.  For text-only, call
+        with just (request_id, prompt, sampling_params).  For multimodal, also
+        pass imgs, num_tiles, and num_img_embeddings_per_tile as keyword args.
+
+        When multimodal kwargs are provided the method will:
+        1. Expand image tokens in the prompt (replace <image> with padding).
+        2. Run the vision encoder to produce image embeddings.
+        3. Store the embeddings and mask in the context for later use by the
+           controller's forward step.
 
         Args:
             request_id (int): Unique ID of request.
             prompt (Union[str, Tensor]): Prompt as either a text string or token IDs.
             sampling_params (Optional[SamplingParams]): Sampling parameters for the request.
+            imgs (Optional[Tensor]): Image tensor [num_tiles, C, H, W] (or None).
+            num_tiles (Optional[Tensor]): Number of tiles per image (1-D tensor, or None).
+            num_img_embeddings_per_tile (int): Number of image embeddings per tile.
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
@@ -826,12 +845,66 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             raise Exception("specialize for <%s>." % type(prompt).__name__)
 
+        # --- VLM: expand image tokens and run vision encoder ---
+        device = torch.cuda.current_device()
+        if imgs is not None:
+            imgs = imgs.to(device=device)
+        if num_tiles is not None:
+            num_tiles = num_tiles.to(device=device)
+
+        total_num_tiles = int(num_tiles.sum().item()) if num_tiles is not None else 0
+        num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
+
+        mask_tensor: Optional[Tensor] = None
+        image_embeddings: Optional[Tensor] = None
+
+        if num_img_embeddings > 0 and num_tiles is not None:
+            # Expand <image> tokens to padding (-1) and build index mask.
+            token_list: List[List[int]] = [tokens.tolist()]
+            expanded_tokens_list, mask_list = (
+                self.controller.inference_wrapped_model.expand_image_tokens(
+                    token_list, num_tiles
+                )
+            )
+            tokens = torch.tensor(
+                expanded_tokens_list[0], dtype=torch.int64, device=device
+            )
+            mask_tensor = torch.tensor(
+                [(-1 if v is None else int(v)) for v in mask_list[0]], device=device
+            )
+
+        if (
+            num_img_embeddings > 0
+            and imgs is not None
+            and num_tiles is not None
+            and is_pipeline_first_stage(self.controller.pp_group)
+        ):
+            with torch.inference_mode():
+                image_embeddings = (
+                    self.controller.inference_wrapped_model._forward_vision_encoder(
+                        imgs, num_tiles
+                    )
+                )
+
+        # Store per-request VLM data in the context (no-op dicts when text-only).
+        self.context.add_vlm_request_data(
+            request_id,
+            image_embeddings=image_embeddings,
+            image_token_mask=mask_tensor,
+        )
+
         # Initialize request.
-        request = DynamicInferenceRequest(
+        request = DynamicVLMInferenceRequest(
             request_id=request_id,
             prompt=prompt_str,
             prompt_tokens=tokens,
             sampling_params=sampling_params,
+            num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+            imgs=imgs,
+            num_tiles=num_tiles,
+            decoder_seq_length=0,
+            image_embeddings=image_embeddings,
+            image_token_mask=mask_tensor,
         )
 
         # Add request.
@@ -1043,6 +1116,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # Clear the stop word being finished set after processing
         self.stop_word_being_finished_ids.clear()
+
+        # Remove VLM data for finished requests from the context.
+        for record in finished_request_records:
+            req = record[-1]
+            self.context.remove_vlm_request_data(req.request_id)
 
         return active_request_ids, finished_request_records
 
@@ -1482,13 +1560,39 @@ class DynamicInferenceEngine(AbstractEngine):
     step = step_legacy
 
     def generate(
-        self, prompts: List[str], sampling_params: Optional[SamplingParams] = SamplingParams()
+        self,
+        prompts: List[str],
+        sampling_params: Optional[SamplingParams] = SamplingParams(),
+        *,
+        imgs: Optional[List[Tensor]] = None,
+        num_tiles: Optional[List[Tensor]] = None,
+        num_img_embeddings_per_tile: int = 0,
     ) -> List[DynamicInferenceRequest]:
-        """Generates completions for a static list of prompts."""
+        """Generates completions for a static list of prompts.
 
-        for prompt in prompts:
+        Supports both text-only and multimodal requests.  For multimodal, pass
+        per-prompt image tensors and tile counts as keyword arguments.
+
+        Args:
+            prompts: List of prompt strings.
+            sampling_params: Sampling parameters (shared across all requests).
+            imgs: Optional list of image tensors, one per prompt.
+            num_tiles: Optional list of tile count tensors, one per prompt.
+            num_img_embeddings_per_tile: Number of image embeddings per tile.
+        """
+
+        for i, prompt in enumerate(prompts):
             request_id = int(next(self.request_counter))
-            _ = self.add_request(request_id, prompt, sampling_params)
+            img = imgs[i] if imgs is not None else None
+            tiles = num_tiles[i] if num_tiles is not None else None
+            _ = self.add_request(
+                request_id,
+                prompt,
+                sampling_params,
+                imgs=img,
+                num_tiles=tiles,
+                num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+            )
 
         finished_request_records_list = []
         while self.has_unfinished_requests():

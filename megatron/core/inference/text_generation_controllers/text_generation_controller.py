@@ -569,6 +569,11 @@ class TextGenerationController:
 
         This also handles logits-broadcasting for pipeline parallelism.
 
+        When the context has image data for active requests (multimodal), the
+        image token mask and image embeddings are passed to the wrapper so that
+        it can scatter pre-computed vision embeddings into the token stream.
+        When no images are present, the standard text-only forward path is used.
+
         Args:
             input_ids (Tensor): The input token IDs.
             position_ids (Tensor): The position IDs.
@@ -576,10 +581,26 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
+        # Check for VLM image data in the context.
+        image_token_mask = context.current_image_token_mask()
+        image_embeddings = context.current_image_embeddings()
+        has_images = (
+            image_token_mask is not None
+            and image_embeddings is not None
+            and (image_token_mask >= 0).any()
+        )
+
+        inference_input = {
+            "tokens": input_ids,
+            "position_ids": position_ids,
+            "attention_mask": None,
+        }
+        if has_images:
+            inference_input["image_token_mask"] = image_token_mask
+            inference_input["image_embeddings"] = image_embeddings
+
         with torch.inference_mode():
-            logits = self.inference_wrapped_model.run_one_forward_step(
-                {"tokens": input_ids, "position_ids": position_ids, "attention_mask": None}
-            )
+            logits = self.inference_wrapped_model.run_one_forward_step(inference_input)
 
         if self.model_is_pipeline_parallel:
             logits_seq_len = (

@@ -4,7 +4,7 @@ import logging
 import math
 import warnings
 from contextlib import nullcontext
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -241,6 +241,11 @@ class DynamicInferenceContext(BaseInferenceContext):
     )
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
         super().__init__(inference_config=inference_config)
+
+        # Per-request VLM data (empty when not using multimodal).
+        self._request_to_image_embeddings: Dict[int, Optional[Tensor]] = {}
+        self._request_to_image_token_mask: Dict[int, Optional[Tensor]] = {}
+        self._request_to_image_token_count: Dict[int, int] = {}
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
@@ -1446,6 +1451,113 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_batch_dimensions = InferenceBatchDimensions(
             token_count=0, prefill_req_count=0, decode_req_count=0
         )
+
+        # Reset VLM data.
+        self._request_to_image_embeddings.clear()
+        self._request_to_image_token_mask.clear()
+        self._request_to_image_token_count.clear()
+
+    # ----- VLM per-request data management -----
+
+    def add_vlm_request_data(
+        self,
+        request_id: int,
+        image_embeddings: Optional[Tensor],
+        image_token_mask: Optional[Tensor],
+    ) -> None:
+        """Attach per-request image data to the context.
+
+        Called at add_request time when a multimodal request has images.
+        No-op overhead for text-only requests that never call this.
+
+        Args:
+            request_id: The request identifier.
+            image_embeddings: Tensor of shape [seq_img, 1, hidden] or None.
+            image_token_mask: 1-D tensor with -1 for text positions and
+                non-negative indices for image embedding positions; or None.
+        """
+        self._request_to_image_embeddings[request_id] = image_embeddings
+        self._request_to_image_token_mask[request_id] = image_token_mask
+        if image_embeddings is not None:
+            self._request_to_image_token_count[request_id] = int(
+                image_embeddings.shape[0] * image_embeddings.shape[1]
+            )
+        else:
+            self._request_to_image_token_count[request_id] = 0
+
+    def remove_vlm_request_data(self, request_id: int) -> None:
+        """Remove image data for a finished request."""
+        self._request_to_image_embeddings.pop(request_id, None)
+        self._request_to_image_token_mask.pop(request_id, None)
+        self._request_to_image_token_count.pop(request_id, None)
+
+    def current_image_token_mask(self) -> Optional[Tensor]:
+        """Flattened image-token mask aligned with current_input_ids.
+
+        Returns a [1, padded_active_token_count] tensor with -1 for non-image
+        positions and non-negative indices into the concatenated image
+        embeddings, or None when there are no active tokens.  During
+        decode-only steps (no image tokens consumed) returns all -1.
+        """
+        if self.padded_active_token_count is None or self.padded_active_token_count == 0:
+            return None
+
+        if self.is_decode_only():
+            return torch.full(
+                (self.padded_active_token_count,),
+                -1,
+                dtype=torch.long,
+                device=torch.cuda.current_device(),
+            )
+
+        segments: List[Tensor] = []
+        cumulative_offset = 0
+        for row_idx in range(self.paused_request_count, self.total_request_count):
+            request_id = int(self.request_ids[row_idx].item())
+            query_len = int(self.request_query_lengths[row_idx].item())
+
+            per_request_mask = self._request_to_image_token_mask.get(request_id, None)
+            if per_request_mask is None:
+                seg = torch.full(
+                    (query_len,), -1, dtype=torch.long, device=torch.cuda.current_device()
+                )
+            else:
+                seg = per_request_mask[:query_len].clone()
+                positive = seg >= 0
+                if positive.any():
+                    seg[positive] += cumulative_offset
+
+            segments.append(seg)
+            cumulative_offset += int(self._request_to_image_token_count.get(request_id, 0))
+
+        if len(segments) == 0:
+            return None
+
+        mask = torch.cat(segments, dim=0)
+        if mask.numel() < int(self.padded_active_token_count):
+            pad = torch.full(
+                (int(self.padded_active_token_count) - mask.numel(),),
+                -1,
+                dtype=torch.long,
+                device=mask.device,
+            )
+            mask = torch.cat([mask, pad], dim=0)
+        return mask.unsqueeze(0)
+
+    def current_image_embeddings(self) -> Optional[Tensor]:
+        """Concatenate image embeddings for active requests.
+
+        Returns tensor of shape [seq_img, N, hidden] or None.
+        """
+        parts: List[Tensor] = []
+        for row_idx in range(self.paused_request_count, self.total_request_count):
+            request_id = int(self.request_ids[row_idx].item())
+            emb = self._request_to_image_embeddings.get(request_id, None)
+            if emb is not None:
+                parts.append(emb)
+        if not parts:
+            return None
+        return torch.cat(parts, dim=1)
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None

@@ -1,7 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-from typing import OrderedDict
+from typing import Optional, OrderedDict
 
 import torch
+from torch import Tensor
 
 from megatron.core.inference.inference_request import InferenceRequest, VLMInferenceRequest
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -11,7 +12,13 @@ from megatron.core.inference.utils import get_attention_mask
 
 
 class VLMTextGenerationController(TextGenerationController):
-    """The text generation controller for VLMs"""
+    """The text generation controller for VLMs.
+
+    Overrides only the static-path ``prep_inference_input`` (batch-size-1 VLM
+    inference).  The dynamic-batching forward path (``_dynamic_step_forward_logits``)
+    is handled entirely by the base ``TextGenerationController``, which checks
+    the context for image data and passes it through when present.
+    """
 
     def prep_inference_input(
         self,

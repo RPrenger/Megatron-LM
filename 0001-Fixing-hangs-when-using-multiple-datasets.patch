@@ -1,0 +1,151 @@
+From f844a7b92b379e6f35f5b486cfa111f018d76172 Mon Sep 17 00:00:00 2001
+From: rprenger <rprenger@nvidia.com>
+Date: Mon, 2 Feb 2026 22:07:55 -0800
+Subject: [PATCH] Fixing hangs when using multiple datasets
+
+---
+ megatron/training/datasets/data_samplers.py | 52 +++++++++++++++++++--
+ megatron/training/training.py               | 45 +++++++++++++-----
+ 2 files changed, 81 insertions(+), 16 deletions(-)
+
+diff --git a/megatron/training/datasets/data_samplers.py b/megatron/training/datasets/data_samplers.py
+index ca4cc1b36..e63947c01 100644
+--- a/megatron/training/datasets/data_samplers.py
++++ b/megatron/training/datasets/data_samplers.py
+@@ -31,13 +31,11 @@ def build_pretraining_data_loader(dataset, consumed_samples):
+         split = None
+ 
+     if split == Split.valid and args.full_validation:
+-        batch_sampler = MegatronPretrainingSampler(
++        # Use specialized sampler for full validation that handles small datasets
++        batch_sampler = MegatronFullValidationSampler(
+             total_samples=len(dataset),
+-            consumed_samples=0,
+-            micro_batch_size=args.micro_batch_size,
+             data_parallel_rank=mpu.get_data_parallel_rank(),
+-            data_parallel_size=mpu.get_data_parallel_world_size(),
+-        )
++            data_parallel_size=mpu.get_data_parallel_world_size())
+     elif args.dataloader_type == 'single':
+         if args.hybrid_context_parallel:
+             batch_sampler = HybridCPMegatronPretrainingSampler(
+@@ -206,6 +204,50 @@ class HybridCPMegatronPretrainingSampler(MegatronPretrainingSampler):
+                 global_batch_idx.extend(batch[start_idx[i]:end_idx[i]])
+             yield global_batch_idx
+ 
++
++class MegatronFullValidationSampler:
++    """Sampler for full validation that handles small datasets gracefully.
++
++    This sampler is designed for validation datasets that may be smaller than
++    data_parallel_size * micro_batch_size. It uses micro_batch_size=1 to minimize
++    the samples needed per batch and properly handles partial batches where some
++    ranks may not have data.
++    """
++
++    def __init__(self, total_samples, data_parallel_rank, data_parallel_size):
++        self.total_samples = total_samples
++        self.data_parallel_rank = data_parallel_rank
++        self.data_parallel_size = data_parallel_size
++        self.micro_batch_size = 1  # Always use 1 for small dataset support
++
++        # Sanity checks
++        assert self.total_samples > 0, f'no sample to consume: {self.total_samples}'
++        assert data_parallel_size > 0
++        assert self.data_parallel_rank < data_parallel_size, \
++            f'data_parallel_rank should be smaller than data size: {self.data_parallel_rank}, {data_parallel_size}'
++
++    def __len__(self):
++        """Returns the number of batches this rank will yield."""
++        # Each batch takes data_parallel_size samples (1 per rank)
++        # This rank gets samples at indices: data_parallel_rank, data_parallel_rank + data_parallel_size, ...
++        num_batches = 0
++        for batch_idx in range(0, self.total_samples, self.data_parallel_size):
++            # Check if this rank has data in this batch
++            sample_idx = batch_idx + self.data_parallel_rank
++            if sample_idx < self.total_samples:
++                num_batches += 1
++        return num_batches
++
++    def __iter__(self):
++        """Yield batches for this data parallel rank."""
++        for batch_idx in range(0, self.total_samples, self.data_parallel_size):
++            # Check if this rank has data in this batch
++            sample_idx = batch_idx + self.data_parallel_rank
++            if sample_idx < self.total_samples:
++                # Yield a batch with a single sample index for this rank
++                yield [sample_idx]
++
++
+ class RandomSeedDataset(Dataset):
+     """
+     A dataset wrapper that resets the random seed before each sample.
+diff --git a/megatron/training/training.py b/megatron/training/training.py
+index 7c394c7b2..cef5cb8b8 100644
+--- a/megatron/training/training.py
++++ b/megatron/training/training.py
+@@ -3298,10 +3298,20 @@ def evaluate_and_print_results(
+         print_rank_last('-' * length)
+ 
+ 
+-def cyclic_iter(iter):
++def cyclic_iter(iterable):
+     while True:
+-        for x in iter:
++        iterator = iter(iterable)
++        count = 0
++        for x in iterator:
++            count += 1
+             yield x
++        if count == 0:
++            # No data was yielded, the iterable is empty
++            raise RuntimeError(
++                "cyclic_iter: iterable produced no data. "
++                "This may indicate the validation dataloader is empty or eval_iters is incorrectly set. "
++                "Check that your validation dataset has data and that the dataloader is properly configured."
++            )
+ 
+ 
+ def get_train_valid_test_num_samples():
+@@ -3487,16 +3497,29 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
+             if valid_dataloaders[0] is None:
+                 valid_data_iterators = [None] * len(valid_dataloaders)
+             else:
+-                valid_dl_type = "cyclic" if args.full_validation else dl_type
+-                print(
+-                    f"[VALID DATA LOADER LENGTHS] "
+-                    ", ".join(f"{idx}: {len(dl)}" for idx, dl in enumerate(valid_dataloaders))
++                # Get the number of batches for this data parallel rank
++                local_eval_iters = [len(dl) for dl in valid_dataloaders]
++                # Compute the maximum across all data parallel ranks to ensure synchronization
++                eval_iters_tensor = torch.tensor(local_eval_iters, dtype=torch.long, device='cuda')
++                torch.distributed.all_reduce(
++                    eval_iters_tensor,
++                    op=torch.distributed.ReduceOp.MAX,
++                    group=mpu.get_data_parallel_group(with_context_parallel=True)
+                 )
+-                valid_data_iterators = [
+-                    _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
+-                ]
+-        elif valid_dataloaders[0] is not None:
+-            valid_data_iterators = _get_iterator(dl_type, valid_dataloaders[0])
++                args.eval_iters = eval_iters_tensor.tolist()
++        else:
++            local_eval_iters = len(valid_dataloaders[0])
++            eval_iters_tensor = torch.tensor([local_eval_iters], dtype=torch.long, device='cuda')
++            torch.distributed.all_reduce(
++                eval_iters_tensor,
++                op=torch.distributed.ReduceOp.MAX,
++                group=mpu.get_data_parallel_group(with_context_parallel=True)
++            )
++            args.eval_iters = eval_iters_tensor.item()
++
++    if args.multiple_validation_sets:
++        if valid_dataloaders[0] is None:
++            valid_data_iterators = [None] * len(valid_dataloaders)
+         else:
+             valid_data_iterators = None
+     else:
+-- 
+2.25.1
+

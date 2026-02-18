@@ -948,6 +948,60 @@ class LLaVAModel(MegatronModule):
 
         return output, new_loss_mask
 
+    def forward_lm_only(
+        self,
+        combined_embeddings,
+        attention_mask=None,
+        labels=None,
+        inference_context=None,
+        runtime_gather_output=None,
+        packed_seq_params=None,
+    ):
+        """Forward pre-combined embeddings through the language model only.
+
+        Bypasses the vision encoder and _preprocess_data. Used by the dynamic
+        inference path where image embeddings have already been scattered into
+        the combined embedding tensor.
+
+        Args:
+            combined_embeddings: [seq_len, batch, hidden] or None on non-first PP stages.
+            attention_mask: Optional attention mask.
+            labels: Optional target labels.
+            inference_context: Inference context (KV cache).
+            runtime_gather_output: Whether to gather output across TP ranks.
+            packed_seq_params: Packed sequence parameters.
+        """
+        try:
+            from megatron.core.models.mamba.mamba_model import MambaModel
+
+            is_mamba = isinstance(self.language_model, MambaModel)
+        except ImportError:
+            is_mamba = False
+
+        if is_mamba:
+            output = self.language_model(
+                input_ids=None,
+                position_ids=None,
+                attention_mask=attention_mask,
+                decoder_input=combined_embeddings,
+                labels=labels,
+                inference_context=inference_context,
+                runtime_gather_output=runtime_gather_output,
+            )
+        else:
+            output = self.language_model(
+                input_ids=None,
+                position_ids=None,
+                attention_mask=attention_mask,
+                decoder_input=combined_embeddings,
+                labels=labels,
+                inference_context=inference_context,
+                runtime_gather_output=runtime_gather_output,
+                packed_seq_params=packed_seq_params,
+            )
+
+        return output
+
 
 def _load_state_dict_hook_ignore_param_names(
     param_names: List[str], module: torch.nn.Module, incompatible_keys: namedtuple
