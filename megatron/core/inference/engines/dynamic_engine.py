@@ -795,12 +795,14 @@ class DynamicInferenceEngine(AbstractEngine):
         imgs: Optional[Tensor] = None,
         num_tiles: Optional[Tensor] = None,
         num_img_embeddings_per_tile: int = 0,
+        imgs_sizes: Optional[Tensor] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
         Supports both text-only and multimodal requests.  For text-only, call
         with just (request_id, prompt, sampling_params).  For multimodal, also
-        pass imgs, num_tiles, and num_img_embeddings_per_tile as keyword args.
+        pass imgs and either (num_tiles + num_img_embeddings_per_tile) for static
+        resolution or imgs_sizes for dynamic resolution.
 
         When multimodal kwargs are provided the method will:
         1. Expand image tokens in the prompt (replace <image> with padding).
@@ -812,9 +814,10 @@ class DynamicInferenceEngine(AbstractEngine):
             request_id (int): Unique ID of request.
             prompt (Union[str, Tensor]): Prompt as either a text string or token IDs.
             sampling_params (Optional[SamplingParams]): Sampling parameters for the request.
-            imgs (Optional[Tensor]): Image tensor [num_tiles, C, H, W] (or None).
-            num_tiles (Optional[Tensor]): Number of tiles per image (1-D tensor, or None).
-            num_img_embeddings_per_tile (int): Number of image embeddings per tile.
+            imgs (Optional[Tensor]): Image tensor [num_tiles, C, H, W] or [1, total_patches, patch_features] (or None).
+            num_tiles (Optional[Tensor]): Number of tiles per image (1-D tensor, or None). Static resolution.
+            num_img_embeddings_per_tile (int): Number of image embeddings per tile. Static resolution.
+            imgs_sizes (Optional[Tensor]): Per-image sizes [N, 2] with [H, W]. Dynamic resolution.
 
         Return:
             Returns an asyncio `Future[DynamicInferenceRequest]` for the user to wait on.
@@ -851,19 +854,24 @@ class DynamicInferenceEngine(AbstractEngine):
             imgs = imgs.to(device=device)
         if num_tiles is not None:
             num_tiles = num_tiles.to(device=device)
+        if imgs_sizes is not None:
+            imgs_sizes = imgs_sizes.to(device=device)
 
+        # Determine if we have images to process
+        is_dynamic_resolution = imgs_sizes is not None and imgs is not None
         total_num_tiles = int(num_tiles.sum().item()) if num_tiles is not None else 0
         num_img_embeddings = num_img_embeddings_per_tile * total_num_tiles
+        has_images = is_dynamic_resolution or num_img_embeddings > 0
 
         mask_tensor: Optional[Tensor] = None
         image_embeddings: Optional[Tensor] = None
 
-        if num_img_embeddings > 0 and num_tiles is not None:
+        if has_images:
             # Expand <image> tokens to padding (-1) and build index mask.
             token_list: List[List[int]] = [tokens.tolist()]
             expanded_tokens_list, mask_list = (
                 self.controller.inference_wrapped_model.expand_image_tokens(
-                    token_list, num_tiles
+                    token_list, num_tiles=num_tiles, imgs_sizes=imgs_sizes
                 )
             )
             tokens = torch.tensor(
@@ -874,15 +882,14 @@ class DynamicInferenceEngine(AbstractEngine):
             )
 
         if (
-            num_img_embeddings > 0
+            has_images
             and imgs is not None
-            and num_tiles is not None
             and is_pipeline_first_stage(self.controller.pp_group)
         ):
             with torch.inference_mode():
                 image_embeddings = (
                     self.controller.inference_wrapped_model._forward_vision_encoder(
-                        imgs, num_tiles
+                        imgs, num_image_tiles=num_tiles, imgs_sizes=imgs_sizes
                     )
                 )
 
@@ -1567,11 +1574,13 @@ class DynamicInferenceEngine(AbstractEngine):
         imgs: Optional[List[Tensor]] = None,
         num_tiles: Optional[List[Tensor]] = None,
         num_img_embeddings_per_tile: int = 0,
+        imgs_sizes: Optional[List[Tensor]] = None,
     ) -> List[DynamicInferenceRequest]:
         """Generates completions for a static list of prompts.
 
         Supports both text-only and multimodal requests.  For multimodal, pass
-        per-prompt image tensors and tile counts as keyword arguments.
+        per-prompt image tensors and either (num_tiles + num_img_embeddings_per_tile)
+        for static resolution or imgs_sizes for dynamic resolution.
 
         Args:
             prompts: List of prompt strings.
@@ -1579,12 +1588,14 @@ class DynamicInferenceEngine(AbstractEngine):
             imgs: Optional list of image tensors, one per prompt.
             num_tiles: Optional list of tile count tensors, one per prompt.
             num_img_embeddings_per_tile: Number of image embeddings per tile.
+            imgs_sizes: Optional list of per-image size tensors [N, 2], one per prompt.
         """
 
         for i, prompt in enumerate(prompts):
             request_id = int(next(self.request_counter))
             img = imgs[i] if imgs is not None else None
             tiles = num_tiles[i] if num_tiles is not None else None
+            sizes = imgs_sizes[i] if imgs_sizes is not None else None
             _ = self.add_request(
                 request_id,
                 prompt,
@@ -1592,6 +1603,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 imgs=img,
                 num_tiles=tiles,
                 num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+                imgs_sizes=sizes,
             )
 
         finished_request_records_list = []

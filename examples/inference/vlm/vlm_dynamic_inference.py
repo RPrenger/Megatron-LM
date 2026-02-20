@@ -14,6 +14,8 @@ Usage modes:
   - Text-only:   engine.add_request(id, prompt, sampling_params)
   - Multimodal:  engine.add_request(id, prompt, sampling_params,
                      imgs=..., num_tiles=..., num_img_embeddings_per_tile=...)
+                 or engine.add_request(id, prompt, sampling_params,
+                     imgs=..., imgs_sizes=...)  # dynamic resolution
 
 V1 limitations:
     - PP=1 only (vision encoder must be on same rank).
@@ -21,6 +23,7 @@ V1 limitations:
 """
 
 import json
+import math
 import os
 import sys
 from collections import defaultdict
@@ -116,6 +119,13 @@ def _detect_vlm_from_checkpoint(args):
         'tokenizer_prompt_format', 'recompute_vision', 'num_frames',
         'freeze_LM', 'freeze_ViT', 'allow_missing_vision_projection_checkpoint',
         'pixel_mean', 'pixel_std', 'use_area_weighted_aspect_ratio',
+        # Dynamic resolution args
+        'dynamic_resolution', 'dynamic_resolution_min_patches',
+        'dynamic_resolution_max_patches',
+        'class_token_len',
+        'radio_force_cpe_eval_mode', 'radio_force_eval_mode',
+        'radio_interpolate_only_cpe', 'radio_cpe_aspect_ratio_select',
+        'radio_disable_cpe',
     ]
     for attr in vlm_attrs:
         val = getattr(checkpoint_args, attr, None)
@@ -161,6 +171,123 @@ def get_model(is_vlm: bool) -> MegatronModule:
 # ---------------------------------------------------------------------------
 # Image preprocessing (only used for VLM + multimodal mode)
 # ---------------------------------------------------------------------------
+
+# Pixel statistics for different vision models.
+CLIP_PIXEL_MEAN = [0.48145466, 0.4578275, 0.40821073]
+CLIP_PIXEL_STD = [0.26862954, 0.26130258, 0.27577711]
+_PIXEL_STATS = {
+    "radio": (CLIP_PIXEL_MEAN, CLIP_PIXEL_STD),
+    "radio-so400m": (CLIP_PIXEL_MEAN, CLIP_PIXEL_STD),
+    "radio-g": ([0.4850, 0.4560, 0.4060], [0.2230, 0.2240, 0.2250]),
+    "cradio-g": (CLIP_PIXEL_MEAN, CLIP_PIXEL_STD),
+    "clip": (CLIP_PIXEL_MEAN, CLIP_PIXEL_STD),
+    "siglip": ([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
+    "internvit": ([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+}
+
+
+def dynamic_res_preprocess(
+    image, min_patches=1, max_patches=128, res_step=16, factor_max=1.0, pixel_shuffle=False,
+):
+    """Resize image to fit within [min_patches, max_patches] preserving aspect ratio.
+
+    Based on megatron-lm's dynamic_res_preprocess.  For pixel_shuffle, patch grid
+    dimensions are rounded to even numbers for compatibility.
+    """
+    orig_width, orig_height = image.size
+
+    closest_patch_height = round(orig_height / res_step + 0.5)
+    closest_patch_width = round(orig_width / res_step + 0.5)
+    patches = closest_patch_height * closest_patch_width
+
+    factor = min(math.sqrt(max_patches / patches), factor_max)
+    target_patch_height = math.floor(factor * closest_patch_height)
+    target_patch_width = math.floor(factor * closest_patch_width)
+
+    if target_patch_height * target_patch_width < min_patches:
+        up_factor = math.sqrt(min_patches / (target_patch_height * target_patch_width))
+        target_patch_height = math.ceil(up_factor * target_patch_height)
+        target_patch_width = math.ceil(up_factor * target_patch_width)
+
+    # Round patch grid to be divisible by 2 for pixel shuffle compatibility.
+    if pixel_shuffle:
+        rem_h = target_patch_height % 2
+        if rem_h != 0:
+            if (target_patch_height + 1) * target_patch_width <= max_patches:
+                target_patch_height += 1
+            else:
+                target_patch_height = max(1, target_patch_height - 1)
+
+        rem_w = target_patch_width % 2
+        if rem_w != 0:
+            if target_patch_height * (target_patch_width + 1) <= max_patches:
+                target_patch_width += 1
+            else:
+                target_patch_width = max(1, target_patch_width - 1)
+
+    assert target_patch_height * target_patch_width <= max_patches
+
+    resized_img = image.resize((target_patch_width * res_step, target_patch_height * res_step))
+    return resized_img
+
+
+def load_and_preprocess_image_dynamic(image_path: str, args):
+    """Load and preprocess an image for dynamic-resolution VLM inference.
+
+    Args:
+        image_path: Path to the image file.
+        args: Megatron args (must have patch_dim, dynamic_resolution_*).
+
+    Returns:
+        imgs: Tensor [1, total_patches, patch_features] on CUDA.
+        imgs_sizes: Tensor [num_images, 2] with [H, W] in pixels on CUDA.
+    """
+    from PIL import Image
+    from torchvision import transforms as T
+
+    img = Image.open(image_path).convert("RGB")
+
+    # Resize to fit within patch budget.
+    patch_dim = args.patch_dim
+    pixel_shuffle = getattr(args, 'pixel_shuffle', False)
+    min_patches = getattr(args, 'dynamic_resolution_min_patches', 1)
+    max_patches = getattr(args, 'dynamic_resolution_max_patches', 128)
+
+    img = dynamic_res_preprocess(
+        img,
+        min_patches=min_patches,
+        max_patches=max_patches,
+        res_step=patch_dim,
+        pixel_shuffle=pixel_shuffle,
+    )
+
+    # Build transform (ToTensor + Normalize only; resize already done above).
+    vision_type = getattr(args, 'vision_model_type', 'radio')
+    pixel_mean = getattr(args, 'pixel_mean', None)
+    pixel_std = getattr(args, 'pixel_std', None)
+    if pixel_mean is None or pixel_std is None:
+        pixel_mean, pixel_std = _PIXEL_STATS.get(vision_type, (CLIP_PIXEL_MEAN, CLIP_PIXEL_STD))
+
+    transform = T.Compose([
+        T.ToTensor(),
+        T.Normalize(mean=pixel_mean, std=pixel_std),
+    ])
+
+    img_tensor = transform(img)  # [C, H, W]
+    C, H, W = img_tensor.shape
+
+    # Patchify: [C, H, W] -> [num_patches, C*patch_dim*patch_dim]
+    py, px = H // patch_dim, W // patch_dim
+    patches = img_tensor.reshape(C, py, patch_dim, px, patch_dim)
+    patches = patches.permute(1, 3, 0, 2, 4).contiguous()
+    patches = patches.reshape(py * px, C * patch_dim * patch_dim)
+
+    # images: [1, num_patches, features], imgs_sizes: [1, 2] with [H, W] in pixels
+    images = patches.unsqueeze(0)
+    imgs_sizes = torch.tensor([[H, W]], dtype=torch.int32)
+
+    return images.cuda(), imgs_sizes.cuda()
+
 
 def load_and_preprocess_image(image_path: str, args):
     """Load and preprocess an image for VLM inference.
@@ -258,8 +385,8 @@ def run_multimodal_inference(
     prompt_entries: List[Dict],
     engine: DynamicInferenceEngine,
     sampling_params: SamplingParams,
-    num_img_embeddings_per_tile: int,
     args,
+    num_img_embeddings_per_tile: int = 0,
 ):
     """Run multimodal inference with images.
 
@@ -267,28 +394,42 @@ def run_multimodal_inference(
         prompt_entries: List of dicts with 'prompt' and optional 'image' keys.
         engine: The dynamic inference engine.
         sampling_params: Sampling parameters.
-        num_img_embeddings_per_tile: Number of image embeddings per tile.
         args: Megatron args.
+        num_img_embeddings_per_tile: Number of image embeddings per tile (static resolution).
     """
+    dynamic_res = getattr(args, 'dynamic_resolution', False)
+
     # Add all requests.
     for req_id, entry in enumerate(prompt_entries):
         prompt_text = entry["prompt"]
         image_path = entry.get("image")
 
         if image_path and os.path.exists(image_path):
-            imgs, num_tiles = load_and_preprocess_image(image_path, args)
+            if dynamic_res:
+                imgs, imgs_sizes = load_and_preprocess_image_dynamic(image_path, args)
+                engine.add_request(
+                    request_id=req_id,
+                    prompt=prompt_text,
+                    sampling_params=sampling_params,
+                    imgs=imgs,
+                    imgs_sizes=imgs_sizes,
+                )
+            else:
+                imgs, num_tiles = load_and_preprocess_image(image_path, args)
+                engine.add_request(
+                    request_id=req_id,
+                    prompt=prompt_text,
+                    sampling_params=sampling_params,
+                    imgs=imgs,
+                    num_tiles=num_tiles,
+                    num_img_embeddings_per_tile=num_img_embeddings_per_tile,
+                )
         else:
-            imgs = None
-            num_tiles = None
-
-        engine.add_request(
-            request_id=req_id,
-            prompt=prompt_text,
-            sampling_params=sampling_params,
-            imgs=imgs,
-            num_tiles=num_tiles,
-            num_img_embeddings_per_tile=num_img_embeddings_per_tile,
-        )
+            engine.add_request(
+                request_id=req_id,
+                prompt=prompt_text,
+                sampling_params=sampling_params,
+            )
 
     # Run inference loop.
     finished_records = []
@@ -340,27 +481,39 @@ def main():
 
     # For VLM, adjust max_sequence_length to account for image tokens.
     num_img_embeddings_per_tile = 0
+    dynamic_res = is_vlm and getattr(args, 'dynamic_resolution', False)
     if is_vlm and hasattr(args, 'img_h') and hasattr(args, 'patch_dim'):
-        from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+        if dynamic_res:
+            # Dynamic resolution: max embeddings = max_patches / 4 (with pixel shuffle).
+            max_patches = getattr(args, 'dynamic_resolution_max_patches', 128)
+            max_img_embeddings = max_patches
+            if getattr(args, 'pixel_shuffle', False):
+                max_img_embeddings = max_img_embeddings // 4
+            inference_config.max_sequence_length = max(
+                inference_config.max_sequence_length,
+                max_img_embeddings + args.num_tokens_to_generate + 512,
+            )
+        else:
+            from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 
-        num_img_embeddings_per_tile = get_num_image_embeddings(
-            args.img_h,
-            args.img_w,
-            args.patch_dim,
-            args.vision_model_type,
-            args.disable_vision_class_token,
-            1,
-            args.pixel_shuffle,
-            args.use_tile_tags,
-            args.max_num_tiles,
-            args.tokenizer_prompt_format,
-        )
-        max_num_tiles = args.max_num_tiles + int(getattr(args, "use_thumbnail", False))
-        max_img_tokens = max_num_tiles * num_img_embeddings_per_tile
-        inference_config.max_sequence_length = max(
-            inference_config.max_sequence_length,
-            max_img_tokens + args.num_tokens_to_generate + 512,
-        )
+            num_img_embeddings_per_tile = get_num_image_embeddings(
+                args.img_h,
+                args.img_w,
+                args.patch_dim,
+                args.vision_model_type,
+                args.disable_vision_class_token,
+                1,
+                args.pixel_shuffle,
+                args.use_tile_tags,
+                args.max_num_tiles,
+                args.tokenizer_prompt_format,
+            )
+            max_num_tiles = args.max_num_tiles + int(getattr(args, "use_thumbnail", False))
+            max_img_tokens = max_num_tiles * num_img_embeddings_per_tile
+            inference_config.max_sequence_length = max(
+                inference_config.max_sequence_length,
+                max_img_tokens + args.num_tokens_to_generate + 512,
+            )
 
     # No CUDA graphs for VLM V1.
     inference_config.num_cuda_graphs = None
@@ -386,7 +539,8 @@ def main():
             prompt_entries = json.load(f)
 
         finished_records = run_multimodal_inference(
-            prompt_entries, engine, sampling_params, num_img_embeddings_per_tile, args
+            prompt_entries, engine, sampling_params, args,
+            num_img_embeddings_per_tile=num_img_embeddings_per_tile,
         )
 
         # Print results.
@@ -426,7 +580,8 @@ def main():
             }
         ]
         finished_records = run_multimodal_inference(
-            prompt_entries, engine, sampling_params, num_img_embeddings_per_tile, args
+            prompt_entries, engine, sampling_params, args,
+            num_img_embeddings_per_tile=num_img_embeddings_per_tile,
         )
 
         if torch.distributed.get_rank() == 0:

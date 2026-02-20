@@ -1,7 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import math
-from typing import Optional, Tuple, Union
+import logging
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -9,6 +10,7 @@ from torch import nn
 
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.models.common.vision_module.vision_module import VisionModule
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.transformer.enums import ModelType
@@ -29,6 +31,52 @@ except ImportError:
 class RADIOViTModel(VisionModule):
     """RADIO ViT vision model.
 
+    Recommended CPE mode:
+    1. CPE w/ force eval mode:
+        - Maintains aspect ratio, maps long edge to 1, resizes then crops
+        - Req. flags
+            - `force_eval_mode=True` (for pre-training)
+            - `force_cpe_eval_mode=True` (for SFT)
+        - Expected defaults:
+            - `has_cpe=True`
+            - `cpe_aspect_ratio_select=False`
+            - `interpolate_only_cpe=False`
+        - To enable randomness, leave `force_eval_mode=False` and `force_cpe_eval_mode=False`
+            - This is the "default" mode for backwards compatibility (not recommended)
+
+    Alternative CPE modes (for baselines)
+    2. CPE w/ force eval mode, cpe_aspect_ratio_select=True:
+        - Maintains aspect ratio, maps long edge to 1, crops then resizes
+            - Slightly worse performance due to border effects along the short edge
+        - Req. flags
+            - `force_eval_mode=True` (for pre-training)
+            - `force_cpe_eval_mode=True` (for SFT)
+            - `cpe_aspect_ratio_select=True`
+        - Expected defaults:
+            - `has_cpe=True`
+            - `interpolate_only_cpe=False`
+        - To enable randomness, leave `force_eval_mode=False` and `force_cpe_eval_mode=False`
+            - This mode has not been trained/evaluated due to worse performance over #1 above
+    3. Interpolate only (no CPE):
+        - Doesn't maintain aspect ratio, maps long edge to 1, directly resizes to input size
+        - Req. flags:
+            - `interpolate_only_cpe=True`
+        - Expected defaults:
+            - cpe_aspect_ratio_select=False`
+            - Others ignored: `has_cpe`, `force_eval_mode`, `force_cpe_eval_mode`
+
+    Other CPE modes (not trained/evaluated):
+    4. Interpolate only (no CPE), cpe_aspect_ratio_select=True:
+        - Maintains aspect ratio, maps long edge to 1, crops then resizes
+        - Same as #2 above, just a different code path to reduce confusing flag settings in init
+    5. Disabled CPE:
+        - Maintains aspect ratio, doesn't map long edge to 1 (if long edge < pos embed long edge), crops then resizes
+        - Req. flags:
+            - `has_cpe=False`
+        - Expected defaults:
+            - `cpe_aspect_ratio_select=False`
+            - Others ignored: `force_eval_mode`, `force_cpe_eval_mode`, `interpolate_only_cpe`
+
     Args:
         transformer_config (TransformerConfig): Transformer config.
         transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers.
@@ -43,8 +91,15 @@ class RADIOViTModel(VisionModule):
         max_img_h (int): Max input image height.
         max_img_w (int): Max input image width.
         pos_dropout (int): Positional encoding dropout value. Defaults to 0.
-        has_cpe: (bool): Whether to use conditional positional encoding. Defaults to True.
+        has_cpe: (bool): Whether to use cropped position embeddings. Defaults to True.
         embedder_bias: (bool): Bias in embedder linear. Defaults to False.
+        dynamic_resolution: (bool): Whether to use dynamic resolution. Defaults to False.
+        force_eval_mode: (bool): Force the model to stay in eval mode. Defaults to False.
+        force_cpe_eval_mode: (bool): Force eval mode only for CPE. Defaults to False.
+        interpolate_only_cpe: (bool): Interpolate position embeddings without cropping. Defaults to False.
+        cpe_aspect_ratio_select: (bool): Select position embeddings based on aspect ratio. Defaults to False.
+        pg_collection (ProcessGroupCollection): Model communication process groups.
+        vp_stage (int): Virtual pipeline stage.
     """
 
     def __init__(
@@ -64,6 +119,11 @@ class RADIOViTModel(VisionModule):
         pos_dropout: int = 0,
         has_cpe: bool = True,
         embedder_bias: bool = False,
+        dynamic_resolution: bool = False,
+        force_eval_mode: bool = False,
+        force_cpe_eval_mode: bool = False,
+        interpolate_only_cpe: bool = False,
+        cpe_aspect_ratio_select: bool = False,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
     ) -> None:
@@ -124,16 +184,26 @@ class RADIOViTModel(VisionModule):
         )
         self.pos_dropout = pos_dropout
         self.has_cpe = has_cpe
+        self.dynamic_resolution = dynamic_resolution
+        self.force_eval_mode = force_eval_mode
+        self.force_cpe_eval_mode = force_cpe_eval_mode
+        self.interpolate_only_cpe = interpolate_only_cpe
+        self.cpe_aspect_ratio_select = cpe_aspect_ratio_select
 
         # Using non-TE version so we can force gather_output
+        # Disable sequence_parallel for the embedder
+        orig_sequence_parallel = transformer_config.sequence_parallel
+        transformer_config.sequence_parallel = False
         self.embedder = ColumnParallelLinear(
             input_size=3 * self.patch_dim * self.patch_dim,
             output_size=self.visual_hidden_size,
             bias=embedder_bias,
             config=transformer_config,
             gather_output=True,
+            disable_grad_reduce=True,
             init_method=lambda tensor: torch.nn.init.normal_(tensor, mean=0.0, std=1.0),
         )
+        transformer_config.sequence_parallel = orig_sequence_parallel
 
         self.model_type = ModelType.encoder_or_decoder
 
@@ -165,6 +235,18 @@ class RADIOViTModel(VisionModule):
             vp_stage=self.vp_stage,
         )
 
+        self.force_cpe_eval_mode = force_cpe_eval_mode  # Simulate eval mode for CPE code only
+        if self.force_eval_mode:  # Eval mode for whole model
+            self.eval()
+
+    def train(self, mode: bool = True) -> 'RADIOViTModel':
+        if mode and self.force_eval_mode:
+            logging.getLogger(__name__).warning(
+                "RADIOViTModel has force_eval_mode=True. Keeping model in eval mode."
+            )
+            return self
+        return super().train(mode)
+
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:
         """Sets input tensor to the model.
 
@@ -174,7 +256,11 @@ class RADIOViTModel(VisionModule):
         self.decoder.set_input_tensor(input_tensor)
 
     def forward(
-        self, x: torch.Tensor, attention_mask: Optional[torch.Tensor] = None
+        self,
+        x: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        imgs_sizes: Optional[Union[List[Tuple[int, int]], torch.Tensor]] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> torch.Tensor:
         """Forward function of the RADIO ViT Model. This function passes the input tensors
         through the embedding layer and then the transformer.
@@ -182,41 +268,83 @@ class RADIOViTModel(VisionModule):
         Args:
             x (torch.Tensor): input data of shape [batch, img_h, img_w]
             attention_mask (torch.Tensor with dtype=bool): Attention mask to use.
+            imgs_sizes (Union[List(Tuple[int, int]), torch.Tensor]): Sizes of the images, for dynamic resolution.
+            packed_seq_params (PackedSeqParams): Packed sequence params for attention.
 
         Returns:
             x (torch.Tensor): output after final transformer block of shape [b, s, h].
         """
-
-        if not HAVE_EINOPS:
-            raise ImportError(
-                "einops is required for RADIOViTModel, please install it with `pip install einops`"
+        if not self.dynamic_resolution:
+            input_size = x.shape[2:]
+            py = x.shape[-2] // self.patch_dim
+            px = x.shape[-1] // self.patch_dim
+            x = rearrange(
+                x,
+                'b c (py yy) (px xx) -> b (py px) (c yy xx)',
+                py=py,
+                yy=self.patch_dim,
+                px=px,
+                xx=self.patch_dim,
             )
-
-        input_size = x.shape[2:]
-        py = x.shape[-2] // self.patch_dim
-        px = x.shape[-1] // self.patch_dim
-        x = rearrange(
-            x,
-            "b c (py yy) (px xx) -> b (py px) (c yy xx)",
-            py=py,
-            yy=self.patch_dim,
-            px=px,
-            xx=self.patch_dim,
-        )
         x, _ = self.embedder(x)  # [batch, seq_length, hidden_size]
 
-        x, _ = self.apply_pos_enc(x, input_size=input_size)
+        # in radio pos embedding added before class token
+        if self.dynamic_resolution:
+            if torch.is_tensor(imgs_sizes):
+                seq_lens = torch.prod(imgs_sizes // self.patch_dim, dim=-1).tolist()
+                sizes_iter = [tuple(sz.tolist()) for sz in imgs_sizes]
+            else:
+                seq_lens = [(h // self.patch_dim) * (w // self.patch_dim) for h, w in imgs_sizes]
+                sizes_iter = imgs_sizes
+
+            assert sum(seq_lens) == x.shape[1], f"{sum(seq_lens)} != {x.shape[1]}"
+
+            chunks = torch.split(x, seq_lens, dim=1)
+            chunks = [
+                self.apply_pos_enc(chunk, input_size=size)[0]
+                for chunk, size in zip(chunks, sizes_iter)
+            ]
+            x = torch.cat(chunks, dim=1)
+        else:
+            x, pos_enc = self.apply_pos_enc(x, input_size=input_size)
 
         if self.add_class_token:
             class_token = self.class_token.expand(
                 x.shape[0], -1, -1
             )  # [batch, class_token_len, hidden_size]
+            if self.dynamic_resolution:
+                # Insert class tokens before each image's patch tokens
+                out = []
+                current_length = 0
+                for input_size in imgs_sizes:
+                    seq_length = input_size[0] // self.patch_dim * input_size[1] // self.patch_dim
+                    out.append(class_token)
+                    out.append(x[:, current_length : current_length + seq_length, :])
+                    current_length += seq_length
+                x = torch.cat(out, dim=1)
+                # Adjust cu_seqlens to account for class tokens
+                # Not using += to avoid double adding in situations
+                # where cu_seqlens_q and cu_seqlens_kv are same underlying tensor
+                add_cu = torch.full_like(
+                    packed_seq_params.cu_seqlens_q, self.class_token_len, dtype=torch.int32
+                )
+                add_cu[0] = 0
+                add_cu = torch.cumsum(add_cu, dim=-1, dtype=torch.int32)
+                packed_seq_params.cu_seqlens_q = packed_seq_params.cu_seqlens_q + add_cu
+                packed_seq_params.cu_seqlens_kv = packed_seq_params.cu_seqlens_kv + add_cu
+                packed_seq_params.max_seqlen_q = (
+                    packed_seq_params.max_seqlen_q + self.class_token_len
+                )
+                packed_seq_params.max_seqlen_kv = (
+                    packed_seq_params.max_seqlen_kv + self.class_token_len
+                )
+            else:
+                x = torch.cat(
+                    [class_token, x], dim=1
+                )  # [batch, seq_length + class_token_len, hidden_size]
 
-            x = torch.cat(
-                [class_token, x], dim=1
-            )  # [batch, seq_length + class_token_len, hidden_size]
-
-        assert x.shape[1] == self.seq_length, f"{x.shape[1]} != {self.seq_length}"
+        if not self.dynamic_resolution:
+            assert x.shape[1] == self.seq_length, f"{x.shape[1]} != {self.seq_length}"
 
         if self.ln_pre:
             x = self.ln_pre(x)
@@ -224,7 +352,7 @@ class RADIOViTModel(VisionModule):
         x = x.permute(1, 0, 2)  # [b, s, h] -> [s, b, h]
         x = x.contiguous()
 
-        x = self.decoder(x, attention_mask=attention_mask)
+        x = self.decoder(x, attention_mask=attention_mask, packed_seq_params=packed_seq_params)
 
         x = x.permute(1, 0, 2)  # [s, b, h] -> [b, s, h]
         x = x.contiguous()
@@ -283,19 +411,43 @@ class RADIOViTModel(VisionModule):
         if (self.max_num_rows, self.max_num_cols) == input_dims:
             return self.position_embeddings
 
-        pos_embed = self.position_embeddings.reshape(
+        pos_embed = self.position_embeddings.reshape(  # (B,L,C) -> (B,C,H,W)
             1, self.max_num_rows, self.max_num_cols, -1
         ).permute(0, 3, 1, 2)
 
         def window_select(pos_embed):
-            if input_dims[0] < pos_embed.shape[-2]:
+            if input_dims[0] < pos_embed.shape[-2]:  # H
                 pos_embed = pos_embed[..., : input_dims[0], :]
-            if input_dims[1] < pos_embed.shape[-1]:
+            if input_dims[1] < pos_embed.shape[-1]:  # W
                 pos_embed = pos_embed[..., :, : input_dims[1]]
             return pos_embed
 
-        if self.has_cpe:
-            if self.training:
+        def aspect_ratio_select(pos_embed):
+            (pos_H, pos_W) = pos_embed.shape[-2:]
+            (input_H, input_W) = input_dims
+
+            # If image is square, return full pos_embed to interpolate
+            if input_H == input_W:
+                return pos_embed
+
+            # Crop the pos_embeds to produce same aspect ratio as original image
+            (crop_H, crop_W) = (pos_H, pos_W)
+            if input_W < input_H:
+                crop_W = min(pos_W, math.ceil(pos_W * (input_W / input_H)))
+            else:  # H < W
+                crop_H = min(pos_H, math.ceil(pos_H * (input_H / input_W)))
+            return pos_embed[..., : crop_H, : crop_W]
+
+        if self.interpolate_only_cpe:
+            if self.cpe_aspect_ratio_select:
+                # Ensures the long edge is always mapped to 1 and the aspect ratio is maintained
+                pos_embed = aspect_ratio_select(pos_embed)
+            pos_embed = F.interpolate(
+                pos_embed.float(), size=input_dims, align_corners=False, mode="bilinear"
+            ).to(pos_embed.dtype)
+
+        elif self.has_cpe:
+            if self.training and not self.force_cpe_eval_mode:
                 min_scale = math.sqrt(0.1)
                 scale = (
                     torch.rand(batch_size, 1, 1, device=pos_embed.device) * (1 - min_scale)
@@ -336,19 +488,35 @@ class RADIOViTModel(VisionModule):
                     padding_mode="zeros",
                     align_corners=True,
                 ).to(pos_embed.dtype)
+
             else:
                 max_dim = max(input_dims)
-                pos_embed = F.interpolate(
-                    pos_embed.float(), size=(max_dim, max_dim), align_corners=True, mode="bilinear"
-                ).to(pos_embed.dtype)
 
-                pos_embed = window_select(pos_embed)
+                (B, C, _H, _W) = pos_embed.shape
+                aspect_ratio_select_required = B * C * max_dim**2 >= torch.iinfo(torch.int32).max
+                if aspect_ratio_select_required or self.cpe_aspect_ratio_select:
+                    # If interpolate output tensor size (numel) >= INT_MAX, interpolate fails so we
+                    #   have to take aspect-ratio crop first then upsample (req. for extreme aspect ratios)
+                    pos_embed = aspect_ratio_select(pos_embed)
+                    pos_embed = F.interpolate(
+                        pos_embed.float(), size=input_dims, align_corners=False, mode="bilinear"
+                    ).to(pos_embed.dtype)
+                else:
+                    # Normal CPE eval mode
+                    pos_embed = F.interpolate(
+                        pos_embed.float(), size=(max_dim, max_dim), align_corners=False, mode="bilinear"
+                    ).to(pos_embed.dtype)
+                    pos_embed = window_select(pos_embed)
+
+        elif self.cpe_aspect_ratio_select:
+            pos_embed = aspect_ratio_select(pos_embed)
         else:
+            # Normal non-CPE mode
             pos_embed = window_select(pos_embed)
 
         if pos_embed.shape[-2:] != input_dims:
             pos_embed = F.interpolate(
-                pos_embed.float(), size=input_dims, align_corners=True, mode="bilinear"
+                pos_embed.float(), size=input_dims, align_corners=False, mode="bilinear"
             ).to(pos_embed.dtype)
 
         pos_embed = pos_embed.flatten(2).permute(0, 2, 1)

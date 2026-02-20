@@ -127,6 +127,13 @@ class LLaVAModel(MegatronModule):
         tokenizer_type: str = "",
         vp_stage: Optional[int] = None,
         use_vision_backbone_fp8_arch: bool = False,
+        dynamic_resolution: bool = False,
+        class_token_len: Optional[int] = None,
+        radio_force_eval_mode: bool = False,
+        radio_force_cpe_eval_mode: bool = False,
+        radio_interpolate_only_cpe: bool = False,
+        radio_cpe_aspect_ratio_select: bool = False,
+        radio_disable_cpe: bool = False,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
@@ -247,13 +254,22 @@ class LLaVAModel(MegatronModule):
                 _load_state_dict_hook_ignore_extra_state
             )
 
+        # Store CLI class_token_len value (will be None if not provided)
+        cli_class_token_len = class_token_len
         class_token_len = 1
         if self.add_encoder:
             self._drop_vision_class_token = drop_vision_class_token
             add_class_token = True
+
+            # Set class_token_len: CLI parameter takes precedence, then model-specific defaults
+            if cli_class_token_len is not None:
+                class_token_len = cli_class_token_len
+
             if vision_transformer_config.vision_model_type.startswith(
                 ("clip", "siglip", "internvit")
             ):
+                if cli_class_token_len is None:
+                    class_token_len = 1
                 if vision_transformer_config.vision_model_type == "siglip":
                     class_token_len = 0
                     add_class_token = False
@@ -276,22 +292,19 @@ class LLaVAModel(MegatronModule):
                 )
             elif vision_transformer_config.vision_model_type in ("radio", "radio-g", "cradio-g"):
                 # TODO: should refactor into model code itself?
-                class_token_len = 0
                 max_img_h = 0
                 max_img_w = 0
                 embedder_bias = False
                 ln_post_impl = None
                 use_mask_token = False
 
-                if vision_transformer_config.vision_model_type == "radio":
+                # Use CLI value if provided, otherwise use model-specific default
+                if cli_class_token_len is None:
                     class_token_len = 8
-                    max_img_h = 2048
-                    max_img_w = 2048
-                    embedder_bias = False
-                    ln_post_impl = None
-                    use_mask_token = False
-                elif vision_transformer_config.vision_model_type == "radio-g":
-                    class_token_len = 5
+
+                if vision_transformer_config.vision_model_type == "radio-g":
+                    if cli_class_token_len is None:
+                        class_token_len = 5
                     max_img_h = 1792
                     max_img_w = 1792
                     embedder_bias = True
@@ -299,8 +312,7 @@ class LLaVAModel(MegatronModule):
 
                     ln_post_impl = TENorm
                     use_mask_token = True
-                elif vision_transformer_config.vision_model_type == "cradio-g":
-                    class_token_len = 8
+                else:
                     max_img_h = 2048
                     max_img_w = 2048
                     embedder_bias = False
@@ -324,6 +336,12 @@ class LLaVAModel(MegatronModule):
                     add_class_token=add_class_token,
                     embedder_bias=embedder_bias,
                     use_mask_token=use_mask_token,
+                    dynamic_resolution=dynamic_resolution,
+                    force_eval_mode=radio_force_eval_mode,
+                    force_cpe_eval_mode=radio_force_cpe_eval_mode,
+                    interpolate_only_cpe=radio_interpolate_only_cpe,
+                    cpe_aspect_ratio_select=radio_cpe_aspect_ratio_select,
+                    has_cpe=not radio_disable_cpe,
                     pg_collection=self.pg_collection,
                     vp_stage=self.vp_stage,
                 )
@@ -389,6 +407,9 @@ class LLaVAModel(MegatronModule):
         self._pixel_shuffle = pixel_shuffle
         self._tile_tags = tile_tags
         self._max_num_tiles = max_num_tiles
+        self._dynamic_resolution = dynamic_resolution
+        self._patch_dim = patch_dim
+        self._class_token_len = class_token_len
 
     def shared_embedding_or_output_weight(self):
         """This is a convenience method to surface the language model's word embeddings, which is
@@ -811,6 +832,8 @@ class LLaVAModel(MegatronModule):
         image_token_index: Optional[int] = None,
         runtime_gather_output: Optional[bool] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        imgs_sizes: Optional[torch.Tensor] = None,
+        vision_packed_seq_params: Optional[PackedSeqParams] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
     ) -> torch.Tensor:
@@ -861,14 +884,39 @@ class LLaVAModel(MegatronModule):
                 0, 0, 0
             )
         elif self.add_encoder and has_images:
-            image_embeddings = self.vision_model(images)  # [num_tiles, img_seq_len, h_vision]
-            if self._drop_vision_class_token:
-                image_embeddings = image_embeddings[:, self.vision_model.class_token_len :, :]
+            if self._dynamic_resolution:
+                image_embeddings = self.vision_model(
+                    images, imgs_sizes=imgs_sizes, packed_seq_params=vision_packed_seq_params
+                )  # [1, total_seq_len, h_vision]
 
-            if self._pixel_shuffle:
-                image_embeddings = pixel_shuffle(
-                    image_embeddings
-                )  # [num_tiles, img_seq_len_shuffled, h_vision_shuffled]
+                # Remove class tokens per-image
+                if self._drop_vision_class_token:
+                    remove_class_token_mask = torch.full(
+                        (image_embeddings.shape[-2],), True, dtype=torch.bool
+                    )
+                    seq_lens = torch.prod(imgs_sizes // self.vision_model.patch_dim, dim=-1)
+                    current_length = 0
+                    for seq_len in seq_lens:
+                        remove_class_token_mask[
+                            current_length : current_length + self.vision_model.class_token_len
+                        ] = False
+                        current_length += seq_len + self.vision_model.class_token_len
+                    image_embeddings = image_embeddings[:, remove_class_token_mask, :]
+
+                if self._pixel_shuffle:
+                    image_embeddings = pixel_shuffle_dynamic_res(
+                        image_embeddings, imgs_sizes, self.vision_model.patch_dim
+                    )
+            else:
+                image_embeddings = self.vision_model(images)  # [num_tiles, img_seq_len, h_vision]
+
+                if self._drop_vision_class_token:
+                    image_embeddings = image_embeddings[:, self.vision_model.class_token_len :, :]
+
+                if self._pixel_shuffle:
+                    image_embeddings = pixel_shuffle(
+                        image_embeddings
+                    )  # [num_tiles, img_seq_len_shuffled, h_vision_shuffled]
 
             # contiguous() required as `permute` can sparsify the tensor and this breaks pipelining
             image_embeddings = image_embeddings.permute(
@@ -1079,5 +1127,49 @@ def pixel_shuffle(x, scale_factor=0.5, version=2):
         x = x.permute(0, 2, 1, 3).contiguous()
 
     x = x.reshape(x.shape[0], -1, x.shape[-1])
+
+    return x
+
+
+def pixel_shuffle_dynamic_res(x, imgs_sizes, patch_dim, scale_factor=0.5, version=2):
+    """Pixel shuffle for dynamic resolution images.
+
+    Splits concatenated embeddings by image using imgs_sizes, applies pixel shuffle
+    per-image with correct H x W layout, then concatenates back.
+
+    Args:
+        x (torch.Tensor): Vision model outputs [num_tiles, img_seq_len, h_vision]
+        imgs_sizes (torch.Tensor): Size of images in packed sequence for dynamic resolution
+        patch_dim (int): Patch dimension size
+        scale_factor (float): Pixel shuffle scale factor. Default 0.5.
+        version (int): Implementation version.
+
+    Returns:
+        x (torch.Tensor): Shuffled vision model outputs
+    """
+    seq_lens = torch.prod(imgs_sizes // patch_dim, dim=-1)
+    splits = torch.split(x, seq_lens.tolist(), dim=-2)
+
+    out = []
+    for i, sv in enumerate(splits):
+        h = imgs_sizes[i][0] // patch_dim
+        w = imgs_sizes[i][1] // patch_dim
+        sv = sv.reshape(sv.shape[0], h, w, -1)
+
+        n, h, w, c = sv.size()
+
+        sv = sv.view(n, h, int(w * scale_factor), int(c / scale_factor))
+        sv = sv.permute(0, 2, 1, 3).contiguous()
+        sv = sv.view(
+            n, int(w * scale_factor), int(h * scale_factor), int(c / (scale_factor * scale_factor))
+        )
+
+        if version == 2:
+            sv = sv.permute(0, 2, 1, 3).contiguous()
+
+        sv = sv.reshape(sv.shape[0], -1, sv.shape[-1])
+        out.append(sv)
+
+    x = torch.cat(out, dim=-2)
 
     return x
