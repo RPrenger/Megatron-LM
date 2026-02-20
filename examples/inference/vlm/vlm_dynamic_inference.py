@@ -10,12 +10,12 @@ checkpoint:
   - GPT checkpoint  -> loads GPT model, runs text-only inference
   - VLM checkpoint  -> loads LLaVA model, supports text + image requests
 
-Usage modes:
-  - Text-only:   engine.add_request(id, prompt, sampling_params)
-  - Multimodal:  engine.add_request(id, prompt, sampling_params,
-                     imgs=..., num_tiles=..., num_img_embeddings_per_tile=...)
-                 or engine.add_request(id, prompt, sampling_params,
-                     imgs=..., imgs_sizes=...)  # dynamic resolution
+Usage:
+  torchrun --nproc-per-node <TP*EP> examples/inference/vlm/vlm_dynamic_inference.py
+
+  Edit the configuration block below to set checkpoint path, parallelism,
+  and input mode.  All model architecture and tokenizer args are loaded
+  automatically from the checkpoint.  CLI args can still override any default.
 
 V1 limitations:
     - PP=1 only (vision encoder must be on same rank).
@@ -26,6 +26,20 @@ import json
 import math
 import os
 import sys
+
+# =====================================================================
+# Configuration — edit these for your setup.
+# Architecture, tokenizer, MoE, Mamba, and VLM args are all loaded
+# automatically from the checkpoint.
+# =====================================================================
+CHECKPOINT_PATH = "/path_to_checkpoint"
+TP_SIZE = 2                   # Must match checkpoint's tensor-model-parallel-size
+EP_SIZE = 32                  # Must match checkpoint's expert-model-parallel-size
+BUFFER_SIZE_GB = 40.0         # GPU memory (GB) allocated for KV cache
+NUM_TOKENS_TO_GENERATE = 256  # Max new tokens per request
+INPUT_IMAGE_PATH = None       # Path to a test image, or None for text-only
+INPUT_PROMPTS_JSON = None     # Path to JSON file with prompts+images, or None
+# =====================================================================
 from collections import defaultdict
 from functools import partial
 from typing import Dict, List, Optional
@@ -447,6 +461,25 @@ def run_multimodal_inference(
 @torch.inference_mode()
 def main():
     """Run VLM dynamic inference."""
+
+    # Inject defaults from the configuration block above.
+    # They go before any user CLI args so that CLI args take precedence.
+    _defaults = [
+        "--load", CHECKPOINT_PATH,
+        "--tensor-model-parallel-size", str(TP_SIZE),
+        "--expert-model-parallel-size", str(EP_SIZE),
+        "--pipeline-model-parallel-size", "1",
+        "--bf16",
+        "--micro-batch-size", "1",
+        "--inference-dynamic-batching",
+        "--inference-dynamic-batching-buffer-size-gb", str(BUFFER_SIZE_GB),
+        "--num-tokens-to-generate", str(NUM_TOKENS_TO_GENERATE),
+    ]
+    if INPUT_IMAGE_PATH:
+        _defaults += ["--input-image-path", INPUT_IMAGE_PATH]
+    if INPUT_PROMPTS_JSON:
+        _defaults += ["--input-prompts-json", INPUT_PROMPTS_JSON]
+    sys.argv[1:1] = _defaults
 
     # Initialize Megatron.
     initialize_megatron(
