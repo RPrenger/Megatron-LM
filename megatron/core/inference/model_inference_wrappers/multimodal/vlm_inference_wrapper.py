@@ -158,12 +158,12 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
         # Reject dynamic-resolution requests when the model does not expose
         # the required attributes. Upstream LLaVAModel sets neither
-        # _dynamic_resolution nor _patch_dim / _class_token_len; without those,
+        # _dynamic_resolution nor patch_dim / _class_token_len; without those,
         # falling through to the static path would silently miscount tokens.
         if imgs_sizes is not None and not getattr(module, '_dynamic_resolution', False):
             raise NotImplementedError(
                 "Dynamic-resolution image expansion requires LLaVAModel "
-                "attributes (_dynamic_resolution, _patch_dim, _class_token_len) "
+                "attributes (_dynamic_resolution, patch_dim, _class_token_len) "
                 "not yet available upstream. Use num_tiles (static resolution) "
                 "or wait for the companion LLaVAModel changes."
             )
@@ -171,7 +171,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         # Compute per-image embedding counts
         if imgs_sizes is not None and getattr(module, '_dynamic_resolution', False):
             # Dynamic resolution: compute per-image embedding count from imgs_sizes
-            patch_dim = module._patch_dim
+            patch_dim = module.patch_dim
             do_pixel_shuffle = module._pixel_shuffle
 
             per_image_embeddings = []
@@ -296,7 +296,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         if imgs_sizes is not None and not getattr(module, '_dynamic_resolution', False):
             raise NotImplementedError(
                 "Dynamic-resolution vision-encoder forward requires "
-                "LLaVAModel._dynamic_resolution/_patch_dim, not yet available "
+                "LLaVAModel._dynamic_resolution/patch_dim, not yet available "
                 "upstream. Use num_tiles (static resolution) or wait for the "
                 "companion LLaVAModel changes."
             )
@@ -304,7 +304,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         # Build vision_packed_seq_params for dynamic resolution
         vision_packed_seq_params = None
         if imgs_sizes is not None and getattr(module, '_dynamic_resolution', False):
-            patch_dim = module._patch_dim
+            patch_dim = module.patch_dim
             seq_lens = torch.prod(imgs_sizes // patch_dim, dim=-1)
             cu_seqlens = torch.cat(
                 [

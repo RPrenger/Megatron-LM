@@ -19,6 +19,7 @@ if _EXAMPLES_MULTIMODAL not in sys.path:
 import torch  # noqa: E402
 
 from examples.multimodal.multimodal_args import add_multimodal_extra_args  # noqa: E402
+from megatron.core.inference.config import ImageProcessingConfig  # noqa: E402
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext  # noqa: E402
 from megatron.core.inference.engines import DynamicInferenceEngine  # noqa: E402
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (  # noqa: E402,E501
@@ -124,6 +125,28 @@ def _build_engine_for_vlm_or_gpt(is_vlm: bool) -> DynamicInferenceEngine:
                 inference_config.max_sequence_length,
                 max_img_tokens + args.num_tokens_to_generate + 512,
             )
+
+    inference_config.image_preprocessing_config = ImageProcessingConfig(
+        patch_dim=args.patch_dim,
+        dynamic_resolution=getattr(args, 'dynamic_resolution', False),
+        use_tiling=getattr(args, 'use_tiling', False),
+        pixel_shuffle=getattr(args, 'pixel_shuffle', False),
+        spatial_merge_size=getattr(args, 'spatial_merge_size', 1),
+        dynamic_resolution_min_patches=getattr(
+            args, 'dynamic_resolution_min_patches', 1
+        ),
+        dynamic_resolution_max_patches=getattr(
+            args, 'dynamic_resolution_max_patches', 128
+        ),
+        vision_model_type=getattr(args, 'vision_model_type', 'radio'),
+        pixel_mean=getattr(args, 'pixel_mean', None),
+        pixel_std=getattr(args, 'pixel_std', None),
+        img_h=getattr(args, 'img_h', None),
+        img_w=getattr(args, 'img_w', None),
+        max_num_tiles=getattr(args, 'max_num_tiles', 1),
+        use_thumbnail=getattr(args, 'use_thumbnail', False),
+        num_img_embeddings_per_tile=args.num_img_embeddings_per_tile,
+    )
 
     context = DynamicInferenceContext(model.config, inference_config)
     wrapped_model = VLMInferenceWrapper(model, context)

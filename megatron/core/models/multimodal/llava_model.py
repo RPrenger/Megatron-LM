@@ -163,7 +163,7 @@ class LLaVAModel(MegatronModule):
         self.add_decoder = add_decoder
         self.vp_stage = vp_stage
         self._dynamic_resolution = dynamic_resolution
-        self._patch_dim = patch_dim
+        self.patch_dim = patch_dim
         self._conv_merging = conv_merging
 
         self.encoder_hidden_state = None
@@ -483,7 +483,7 @@ class LLaVAModel(MegatronModule):
         self._pixel_shuffle = pixel_shuffle
         self._tile_tags = tile_tags
         self._max_num_tiles = max_num_tiles
-        self._patch_dim = patch_dim
+        self.patch_dim = patch_dim
         self._class_token_len = class_token_len
 
         # Audio/video attributes kept for API compatibility with upstream. The
@@ -677,7 +677,7 @@ class LLaVAModel(MegatronModule):
         if self._dynamic_resolution and imgs_sizes is not None:
             # Per-tile token counts for dynamic resolution.
             img_seq_len = torch.prod(
-                imgs_sizes // self._patch_dim, dim=-1, dtype=torch.int32
+                imgs_sizes // self.patch_dim, dim=-1, dtype=torch.int32
             ) + (0 if self._drop_vision_class_token else self.vision_model.class_token_len)
             if self._pixel_shuffle:
                 img_seq_len = (img_seq_len * (0.5**2)).int()
