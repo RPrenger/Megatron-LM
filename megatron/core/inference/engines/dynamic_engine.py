@@ -43,6 +43,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     DynamicVLMInferenceRequest,
     Status,
+    resolve_multimodal_data_for_engine,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
@@ -2776,23 +2777,17 @@ class DynamicInferenceEngine(AbstractEngine):
             data = msgpack.unpackb(message, raw=False)
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
-                # Payload is [request_id, prompt, sampling_params, image_payload].
-                # image_payload is either list[bytes] (preprocess here) or a
-                # tensor dict (use directly).
+                # Payload is [request_id, prompt, sampling_params, multi_modal_data].
                 fields = data[1:]
                 if len(fields) == 3:
                     request_id, prompt, sampling_params = fields
-                    image_payload = None
+                    multi_modal_data = None
                 else:
-                    request_id, prompt, sampling_params, image_payload = fields[:4]
+                    request_id, prompt, sampling_params, multi_modal_data = fields[:4]
                 sampling_params = SamplingParams.deserialize(sampling_params)
                 nvtx_range_push("add_request")
-                from megatron.core.inference.inference_request import (
-                    resolve_image_payload_for_engine,
-                )
-
-                vlm_kwargs = resolve_image_payload_for_engine(
-                    image_payload,
+                vlm_kwargs = resolve_multimodal_data_for_engine(
+                    multi_modal_data,
                     image_preprocessing_config=self.context.config.image_preprocessing_config,
                 )
                 if vlm_kwargs:
